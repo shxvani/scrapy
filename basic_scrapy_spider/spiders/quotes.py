@@ -47,64 +47,68 @@ class AmazonReviewsSpider(scrapy.Spider):
                     "rating": review_element.css("*[data-hook*=review-star-rating] ::text").re(r"(\d+\.*\d*) out")[0],
                     }
     
-
+import json
+import math
 import scrapy
-from urllib.parse import urljoin
+from urllib.parse import urlencode
 
-class WalmartReviewsSpider(scrapy.Spider):
-    name = "walmart_reviews"
+class WalmartSpider(scrapy.Spider):
+    name = "walmart"
 
     custom_settings = {
-        'FEEDS': {'data/%(name)s_%(time)s.csv': {'format': 'csv',}}
-    }
+        'FEEDS': { 'data/%(name)s_%(time)s.csv': { 'format': 'csv',}}
+        }
 
     def start_requests(self):
-        asin_list = ['747584156']
-        for asin in asin_list:
-            walmart_reviews_url = f'https://www.walmart.com/reviews/product/{asin}/'
-            yield scrapy.Request(url=walmart_reviews_url, callback=self.parse_reviews, meta={'asin': asin, 'retry_count': 0})
+        keyword_list = ['laptop']
+        for keyword in keyword_list:
+            payload = {'q': keyword, 'sort': 'best_seller', 'page': 1, 'affinityOverride': 'default'}
+            walmart_search_url = 'https://www.walmart.com/search?' + urlencode(payload)
+            yield scrapy.Request(url=walmart_search_url, callback=self.parse_search_results, meta={'keyword': keyword, 'page': 1})
 
-    def parse_reviews(self, response):
-        asin = response.meta['asin']
-        retry_count = response.meta['retry_count']
+    def parse_search_results(self, response):
+        page = response.meta['page']
+        keyword = response.meta['keyword'] 
+        script_tag  = response.xpath('//script[@id="__NEXT_DATA__"]/text()').get()
+        if script_tag is not None:
+            json_blob = json.loads(script_tag)
 
-        next_page_relative_url = response.css('a[aria-label="Next Page"]::attr(href)').get()
-        if next_page_relative_url is not None:
-            retry_count = 0
-            next_page = urljoin('https://www.walmart.com/', next_page_relative_url)
-            yield scrapy.Request(url=next_page, callback=self.parse_reviews, meta={'asin': asin, 'retry_count': retry_count})
+            ## Request Product Page
+            product_list = json_blob["props"]["pageProps"]["initialData"]["searchResult"]["itemStacks"][0]["items"]
+            for idx, product in enumerate(product_list):
+                walmart_product_url = 'https://www.walmart.com' + product.get('canonicalUrl', '').split('?')[0]
+                yield scrapy.Request(url=walmart_product_url, callback=self.parse_product_data, meta={'keyword': keyword, 'page': page, 'position': idx + 1})
+            
+            ## Request Next Page
+            if page == 1:
+                total_product_count = json_blob["props"]["pageProps"]["initialData"]["searchResult"]["itemStacks"][0]["count"]
+                max_pages = math.ceil(total_product_count / 40)
+                if max_pages > 5:
+                    max_pages = 5
+                for p in range(2, max_pages):
+                    payload = {'q': keyword, 'sort': 'best_seller', 'page': p, 'affinityOverride': 'default'}
+                    walmart_search_url = 'https://www.walmart.com/search?' + urlencode(payload)
+                    yield scrapy.Request(url=walmart_search_url, callback=self.parse_search_results, meta={'keyword': keyword, 'page': p})
+    
 
-        # Retry logic for JavaScript rendered review pages
-        elif retry_count < 3:
-            retry_count += 1
-            yield scrapy.Request(url=response.url, callback=self.parse_reviews, dont_filter=True, meta={'asin': asin, 'retry_count': retry_count})
-
-        # Parse Product Reviews
-        review_elements = response.css(".review")
-
-        if not review_elements:
-            self.logger.warning(f"No review elements found on page: {response.url}")
-
-        for review_element in review_elements:
-            try:
-                text = "".join(review_element.css(".review-text ::text").getall()).strip()
-                title = review_element.css(".review-title ::text").get()
-                location_and_date = review_element.css(".review-footer-userLocation ::text").get()
-                verified = bool(review_element.css(".review-badge ::text").get())
-                rating = review_element.css(".stars-container span.visuallyhidden::text").re_first(r"(\d+\.*\d*) out of 5 stars")
-
-                if not text or not title or not rating:
-                    self.logger.warning(f"Missing data in review element: {review_element.extract()}")
-
-                yield {
-                    "asin": asin,
-                    "text": text,
-                    "title": title,
-                    "location_and_date": location_and_date,
-                    "verified": verified,
-                    "rating": rating,
-                }
-            except Exception as e:
-                self.logger.error(f"Error parsing review element: {review_element.extract()} - Error: {e}")
-
+    def parse_product_data(self, response):
+        script_tag  = response.xpath('//script[@id="__NEXT_DATA__"]/text()').get()
+        if script_tag is not None:
+            json_blob = json.loads(script_tag)
+            raw_product_data = json_blob["props"]["pageProps"]["initialData"]["data"]["product"]
+            yield {
+                'keyword': response.meta['keyword'],
+                'page': response.meta['page'],
+                'position': response.meta['position'],
+                'id':  raw_product_data.get('id'),
+                'type':  raw_product_data.get('type'),
+                'name':  raw_product_data.get('name'),
+                'brand':  raw_product_data.get('brand'),
+                'averageRating':  raw_product_data.get('averageRating'),
+                'manufacturerName':  raw_product_data.get('manufacturerName'),
+                'shortDescription':  raw_product_data.get('shortDescription'),
+                'thumbnailUrl':  raw_product_data['imageInfo'].get('thumbnailUrl'),
+                'price':  raw_product_data['priceInfo']['currentPrice'].get('price'), 
+                'currencyUnit':  raw_product_data['priceInfo']['currentPrice'].get('currencyUnit'),  
+            }
 
